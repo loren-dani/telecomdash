@@ -37,8 +37,10 @@ st.sidebar.header('Premissas da campanha')
 desconto = st.sidebar.slider('Desconto na mensalidade (%)', 0, 50, 10, 1) / 100
 efetividade = st.sidebar.slider('Churners corretamente identificados que serão retidos (%)', 0, 100, 30, 5) / 100
 margem = st.sidebar.slider('Margem de contribuição (%)', 0, 100, 70, 5) / 100
-meses = st.sidebar.slider('Horizonte de retenção (meses)', 1, 24, 6, 1)
-st.sidebar.caption('Hipóteses editáveis, não estimativas causais. O desconto é aplicado durante todo o horizonte.')
+meses = st.sidebar.slider('Horizonte de retenção (meses)', 1, 24, 12, 1)
+promocao = st.sidebar.radio('Duração da promoção (meses)', options=[1, 3, 5, 6], index=1, horizontal=True)
+meses_desconto = min(promocao, meses)
+st.sidebar.caption(f'O desconto incide por {meses_desconto} mês(es), dentro do horizonte de {meses} mês(es). Hipóteses editáveis, não estimativas causais.')
 
 modelos = {
     'Random Forest baseline': 'RF_Baseline',
@@ -73,13 +75,14 @@ for nome, coluna in modelos.items():
     # Benefício = contribuição dos churners que a campanha efetivamente retém.
     beneficio = receita_tp * efetividade * margem * meses
     # Desconto para falsos positivos e para churners efetivamente retidos.
-    custo_fp = receita_fp * desconto * meses
-    custo_tp = receita_tp * efetividade * desconto * meses
+    custo_fp = receita_fp * desconto * meses_desconto
+    custo_tp = receita_tp * efetividade * desconto * meses_desconto
     custo = custo_fp + custo_tp
     liquido = beneficio - custo
     roi = liquido / custo if custo > 0 else np.nan
-    breakeven = (receita_fp * desconto / (receita_tp * (margem - desconto))
-                 if receita_tp > 0 and margem > desconto else np.nan)
+    denominador_equilibrio = receita_tp * (margem * meses - desconto * meses_desconto)
+    breakeven = (receita_fp * desconto * meses_desconto / denominador_equilibrio
+                 if denominador_equilibrio > 0 else np.nan)
     linhas.append({
         'Modelo': nome, 'Clientes abordados': tp + fp, 'VP': tp, 'FP': fp, 'FN': fn, 'VN': tn,
         'Precisão': tp / (tp + fp) if tp + fp else 0,
@@ -93,6 +96,7 @@ for nome, coluna in modelos.items():
 resultado = pd.DataFrame(linhas)
 
 st.subheader('Comparação financeira entre modelos')
+st.caption(f'Cenário: {pct(desconto)} de desconto por {meses_desconto} mês(es), horizonte de {meses} mês(es), efetividade {pct(efetividade)} e margem {pct(margem)}.')
 colunas_tabela = ['Modelo', 'Clientes abordados', 'VP', 'FP', 'Precisão', 'Recall', 'F1', 'Benefício', 'Custo total', 'Resultado líquido', 'ROI']
 tabela = resultado[colunas_tabela].copy()
 for c in ['Precisão', 'Recall', 'F1', 'ROI']:
@@ -127,15 +131,34 @@ if pd.notna(r['Efetividade de equilíbrio']):
     st.info(f"Efetividade mínima estimada para equilíbrio financeiro: **{pct(r['Efetividade de equilíbrio'])}**. "
             'Valores superiores a 100% indicam que as premissas atuais não permitem atingir o equilíbrio.')
 else:
-    st.info('Não há ponto de equilíbrio positivo calculável com as premissas atuais (margem menor ou igual ao desconto, ou receita de VP igual a zero).')
+    st.info('Não há ponto de equilíbrio positivo calculável com as premissas atuais: a contribuição preservada por VP não supera seu próprio desconto, ou não há receita de VP.')
+
+st.subheader('Sensibilidade à efetividade da campanha')
+st.caption('Resultado líquido estimado para cada modelo, variando a taxa de retenção efetiva de 0% a 100%.')
+curvas = []
+for nome, coluna in modelos.items():
+    pred = dados[coluna]
+    receita_tp = dados.loc[(dados['Churn_Real'] == 1) & (pred == 1), 'MonthlyCharges'].sum()
+    receita_fp = dados.loc[(dados['Churn_Real'] == 0) & (pred == 1), 'MonthlyCharges'].sum()
+    for taxa in np.linspace(0, 1, 101):
+        liquido_sensibilidade = (receita_tp * taxa * margem * meses
+                               - receita_fp * desconto * meses_desconto
+                               - receita_tp * taxa * desconto * meses_desconto)
+        curvas.append({'Modelo': nome, 'Efetividade (%)': taxa * 100,
+                       'Resultado líquido (R$)': liquido_sensibilidade})
+fig3 = px.line(pd.DataFrame(curvas), x='Efetividade (%)', y='Resultado líquido (R$)',
+               color='Modelo', title='Sensibilidade do resultado financeiro')
+fig3.add_hline(y=0, line_dash='dash', line_color='gray')
+st.plotly_chart(fig3, use_container_width=True)
+
 
 with st.expander('Metodologia e limitações'):
     st.markdown('''**VP**: cliente que realmente cancelou e foi identificado pelo modelo. **FP**: cliente que não cancelou, mas foi identificado para oferta.
 
 - **Benefício** = soma das mensalidades dos VP × efetividade × margem × meses.
-- **Custo FP** = soma das mensalidades dos FP × desconto × meses.
-- **Custo VP retidos** = soma das mensalidades dos VP × efetividade × desconto × meses.
+- **Custo FP** = soma das mensalidades dos FP × desconto × meses de promoção (limitados ao horizonte).
+- **Custo VP retidos** = soma das mensalidades dos VP × efetividade × desconto × meses de promoção (limitados ao horizonte).
 - **Resultado líquido** = benefício − custo FP − custo VP retidos.
 - **ROI** = resultado líquido ÷ custo total; não é definido quando o custo é zero.
 
-O cálculo supõe que clientes retidos permaneçam durante todo o horizonte; clientes que recusam a oferta não geram receita nem desconto; todos os FP abordados recebem desconto; não há custo operacional, impostos ou custo de aquisição. O desconto reduz receita, mas o cálculo não modela mudanças de consumo. A efetividade é uma hipótese e não foi identificada por experimento causal. Métricas dos modelos são da mesma amostra de validação, que também foi usada para escolher limiares; resultados podem ser otimistas. A avaliação financeira é um cenário, não uma previsão garantida.''')
+O ponto de equilíbrio considera benefício ao longo do horizonte e desconto apenas durante a promoção. O cálculo supõe que clientes retidos permaneçam durante todo o horizonte; clientes que recusam a oferta não geram receita nem desconto; todos os FP abordados recebem desconto; não há custo operacional, impostos ou custo de aquisição. O desconto reduz receita, mas o cálculo não modela mudanças de consumo. A efetividade é uma hipótese e não foi identificada por experimento causal. Métricas dos modelos são da mesma amostra de validação, que também foi usada para escolher limiares; resultados podem ser otimistas. A avaliação financeira é um cenário, não uma previsão garantida.''')
